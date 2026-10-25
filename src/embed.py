@@ -1,141 +1,167 @@
-import json
-import pickle
-import os
+import re, json, pickle, argparse
 from pathlib import Path
-from collections import defaultdict
-
-import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModel
-from tqdm import tqdm
+import torch
+from sentence_transformers import SentenceTransformer
+
+MODEL_NAME = "pierluigic/xl-lexeme"
+CACHE_VERSION = 4
 
 
-#Config
-USAGES_PATH      = "dev/SV/usages.jsonl"
-DEFINITIONS_PATH = "dev/SV/definitions.jsonl"
-USAGES_OUT_DIR   = "embeddings/SV/usages"
-DEFINITIONS_OUT  = "embeddings/SV/definitions.pkl"
-MODEL_NAME       = "pierluigic/xl-lexeme"
+def project_root() -> Path:
+    for root in [Path("/kaggle/working"), Path("/content"), Path.cwd()]:
+        if any((root / p).exists() for p in ("embeddings_final", "dev", "test", "usages.jsonl")):
+            return root
+    return Path("/kaggle/working") if Path("/kaggle/working").exists() else Path.cwd()
+
+
+def find_data(lang, data_root=None):
+    lang = lang.upper()
+    roots = ([Path(data_root)] if data_root else []) + [project_root()]
+    subdirs = ([f"{data_root}/{lang}"] if data_root else []) + [f"dev/{lang}", f"test/{lang}", lang, "."]
+    found = {}
+    for key, fname in (("usages", "usages.jsonl"), ("definitions", "definitions.jsonl"), ("labels", "subtask2.jsonl")):
+        for base in roots:
+            hit = next((base / sd / fname for sd in subdirs if (base / sd / fname).exists()), None)
+            if hit:
+                found[key] = str(hit)
+                break
+    return found
+
+
+def read_jsonl(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(l) for l in f if l.strip()]
 
 
 def load_model():
-    print(f"Loading model: {MODEL_NAME}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model     = AutoModel.from_pretrained(MODEL_NAME)
-    model.eval()
-    return tokenizer, model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading {MODEL_NAME} on {device}")
+    return SentenceTransformer(MODEL_NAME, device=device).eval()
 
 
-def get_target_embedding(sentence, start, end, tokenizer, model):
-    inputs = tokenizer(
-        sentence,
-        return_tensors="pt",
-        return_offsets_mapping=True,
-        truncation=True,
-        max_length=512
-    )
-
-    offset_mapping = inputs.pop("offset_mapping")[0]
-
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    hidden_states = outputs.last_hidden_state[0]  # shape: (seq_len, 768)
-
-    # Find which tokens correspond to the target word using character offsets
-    target_indices = [
-        idx for idx, (tok_start, tok_end) in enumerate(offset_mapping)
-        if tok_start >= start and tok_end <= end and tok_end > tok_start
-    ]
-
-    if target_indices:
-        # Average embeddings of all target word tokens
-        target_embedding = hidden_states[target_indices].mean(dim=0)
-    else:
-        # Fallback: average all non-special tokens
-        print(f"  Warning: no tokens found for offsets [{start}:{end}] in sentence, using fallback.")
-        target_embedding = hidden_states[1:-1].mean(dim=0)
-
-    return target_embedding.cpu().numpy()
+def fix_span(text, start, end, word):
+    span = text[start:end]
+    stem = word[:3].lower()
+    on_boundary = (start == 0 or not text[start - 1].isalnum()) and (end >= len(text) or not text[end].isalnum())
+    if span and (stem in span.lower() or (not any(c.isspace() for c in span) and on_boundary)):
+        return start, end
+    cands = [m for m in re.finditer(r"\w+", text) if m.group(0).lower().startswith(stem)]
+    if not cands:
+        return start, end
+    m = min(cands, key=lambda m: abs(m.start() - start))
+    return m.start(), m.end()
 
 
-def embed_usages(tokenizer, model):
-    print("\nEmbedding usages...")
-
-    # Group all usages by word first
-    word_usages = defaultdict(list)
-    with open(USAGES_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            entry = json.loads(line)
-            word_usages[entry["word"]].append(entry)
-
-    os.makedirs(USAGES_OUT_DIR, exist_ok=True)
-
-    for word, usages in word_usages.items():
-        print(f"\nProcessing word: {word} ({len(usages)} usages)")
-        word_data = []
-
-        for usage in tqdm(usages, desc=f"  {word}"):
-            embedding = get_target_embedding(
-                sentence  = usage["text"],
-                start     = usage["start"],
-                end       = usage["end"],
-                tokenizer = tokenizer,
-                model     = model
-            )
-
-            word_data.append({
-                "word"         : usage["word"],
-                "sentence_id"  : usage["sentence_id"],
-                "period_label" : usage["period_label"],
-                "year"         : usage["year"],
-                "embedding"    : embedding       # numpy array shape (768,)
-            })
-
-        out_path = os.path.join(USAGES_OUT_DIR, f"{word}.pkl")
-        with open(out_path, "wb") as f:
-            pickle.dump(word_data, f)
-        print(f"  Saved {len(word_data)} embeddings → {out_path}")
+def prepare(tok, text, start, end, max_len):
+    left = tok.tokenize(text[:start])
+    span = tok.tokenize("<t>") + tok.tokenize(text[start:end]) + tok.tokenize("</t>")
+    right = tok.tokenize(text[end:])
+    budget = max_len - 2
+    if len(left) + len(span) + len(right) > budget:
+        room = max(budget - len(span), 0)
+        l_allow, r_allow = room // 2, room - room // 2
+        if len(left) < l_allow:
+            r_allow += l_allow - len(left)
+            l_allow = len(left)
+        if len(right) < r_allow:
+            l_allow += r_allow - len(right)
+            r_allow = len(right)
+        left = left[len(left) - l_allow:]
+        right = right[:r_allow]
+    return tok.convert_tokens_to_ids([tok.cls_token] + left + span + right + [tok.sep_token])
 
 
-def embed_definitions(tokenizer, model):
-    print("\nEmbedding definitions...")
+def encode(model, items, bs=32):
+    tok = model.tokenizer
+    prepared = [prepare(tok, t, s, e, model.max_seq_length) for t, s, e in items]
+    out = [None] * len(items)
+    order = np.argsort([-len(p) for p in prepared])
+    for b in range(0, len(order), bs):
+        idx = order[b:b + bs]
+        L = max(len(prepared[i]) for i in idx)
+        ids = [prepared[i] + [tok.pad_token_id] * (L - len(prepared[i])) for i in idx]
+        att = [[1] * len(prepared[i]) + [0] * (L - len(prepared[i])) for i in idx]
+        feats = {"input_ids": torch.tensor(ids, device=model.device),
+                 "attention_mask": torch.tensor(att, device=model.device)}
+        with torch.no_grad():
+            se = model(feats)["sentence_embedding"].cpu().numpy()
+        for k, i in enumerate(idx):
+            out[i] = se[k]
+    return np.stack(out)
 
-    definitions_data = {}
 
-    with open(DEFINITIONS_PATH, "r", encoding="utf-8") as f:
-        entries = [json.loads(line) for line in f]
+def _meta(lang):
+    return {"version": CACHE_VERSION, "model": MODEL_NAME, "lang": lang}
 
-    for entry in tqdm(entries, desc="  definitions"):
-        word       = entry["word"]
-        definition = entry["definition"]
 
-        # For definitions we embed the entire definition text as a sentence
-        embedding = get_target_embedding(
-            sentence  = definition,
-            start     = 0,
-            end       = len(definition),
-            tokenizer = tokenizer,
-            model     = model
-        )
+def cache_ok(out_dir, lang):
+    try:
+        for name in ("usages.pkl", "definitions.pkl"):
+            with open(Path(out_dir) / name, "rb") as f:
+                if pickle.load(f).get("meta") != _meta(lang):
+                    return False
+        return True
+    except Exception:
+        return False
 
-        definitions_data[word] = {
-            "word"       : word,
-            "definition" : definition,
-            "embedding"  : embedding    # numpy array shape (768,)
-        }
 
-    os.makedirs(os.path.dirname(DEFINITIONS_OUT), exist_ok=True)
-    with open(DEFINITIONS_OUT, "wb") as f:
-        pickle.dump(definitions_data, f)
-    print(f"  Saved {len(definitions_data)} definition embeddings → {DEFINITIONS_OUT}")
+def embed_language(lang, usages_path, definitions_path, out_dir, model=None, force=False):
+    lang, out_dir = lang.upper(), Path(out_dir)
+    if cache_ok(out_dir, lang) and not force:
+        print(f"[{lang}] embeddings found in {out_dir} (use --force to recompute)")
+        return str(out_dir)
+    model = model or load_model()
+
+    usages = read_jsonl(usages_path)
+    items, n_fixed = [], 0
+    for u in usages:
+        s, e = fix_span(u["text"], u["start"], u["end"], u["word"])
+        n_fixed += (s, e) != (u["start"], u["end"])
+        items.append((u["text"], s, e))
+    print(f"[{lang}] {len(usages)} usages ({n_fixed} misaligned spans repaired)")
+    vecs = encode(model, items)
+    emb = {(u["word"], u["sentence_id"]): vecs[i] for i, u in enumerate(usages)}
+    info = {(u["word"], u["sentence_id"]): {"period_label": u.get("period_label"), "year": u.get("year")}
+            for u in usages}
+
+    defs = {}
+    if definitions_path:
+        text = {}
+        for d in read_jsonl(definitions_path):
+            text.setdefault(d["word"], d["definition"].strip().rstrip(".").strip())
+        words = list(text)
+        if words:
+            v = encode(model, [(f"{w}: {text[w]}", 0, len(w)) for w in words])
+            defs = {w: {"definition": text[w], "variants": {"colon": v[i]}} for i, w in enumerate(words)}
+        print(f"[{lang}] {len(defs)} definitions embedded")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "usages.pkl", "wb") as f:
+        pickle.dump({"meta": _meta(lang), "emb": emb, "info": info}, f)
+    with open(out_dir / "definitions.pkl", "wb") as f:
+        pickle.dump({"meta": _meta(lang), "defs": defs}, f)
+    return str(out_dir)
 
 
 def main():
-    tokenizer, model = load_model()
-    embed_usages(tokenizer, model)
-    embed_definitions(tokenizer, model)
-    print("\nDone. All embeddings saved.")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lang", nargs="+", default=["SV"])
+    ap.add_argument("--data-root", default=None)
+    ap.add_argument("--out-root", default=None)
+    ap.add_argument("--force", action="store_true")
+    a = ap.parse_args()
+    out_root = Path(a.out_root) if a.out_root else project_root() / "embeddings_final"
+    model = None
+    for lang in (l.upper() for l in a.lang):
+        paths = find_data(lang, a.data_root)
+        if "usages" not in paths:
+            print(f"[{lang}] usages.jsonl not found, skipping")
+            continue
+        if model is None and (a.force or not cache_ok(out_root / lang, lang)):
+            model = load_model()
+        embed_language(lang, paths["usages"], paths.get("definitions"), out_root / lang, model, a.force)
+    print("Done.")
 
 
 if __name__ == "__main__":
